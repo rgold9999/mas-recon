@@ -25,6 +25,7 @@ all = [
 
 [project.scripts]
 mas-recon = "mas_recon.cli:main"
+mas-recon-chatdev = "mas_recon.chatdev_adapter:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["mas_recon"]

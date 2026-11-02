@@ -429,9 +429,10 @@ def main() -> None:
         summary_path = Path(agg["out_dir"]) / "SUMMARY.md"
         summary_path.write_text(summary)
         print(f"sessions: {agg['sessions_with_logs']}/{agg['sessions_total']} parsed")
-        print(f"total findings: {agg['total_findings']} "
-              f"(silent: {agg['total_silent_failures']}, self-corrected: {agg['total_self_corrected']}, "
-              f"infra retries: {agg['total_infra_retries']})")
+        print(f"behavioral findings: {agg['total_findings']} "
+              f"(silent: {agg['total_silent_failures']}, self-corrected: {agg['total_self_corrected']})")
+        print(f"infra retries (separate): {agg['sessions_with_infra_retries']} session(s), "
+              f"{agg['total_infra_retry_events']} event(s)")
         print(f"summary written to {summary_path}")
     else:
         parsed = parse_chatdev_log(path)

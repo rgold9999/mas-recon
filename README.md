@@ -1,6 +1,6 @@
 # MAS Recon
 
-Point it at a running multi-agent system; get back the real agent topology and a silent-failure report, from an actual run — not a static guess at the source code.
+Point it at a running multi-agent system; get back the real agent topology and a silent-failure report, from an actual run.
 
 ```python
 from mas_recon import start_capture

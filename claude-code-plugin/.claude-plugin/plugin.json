@@ -1,0 +1,5 @@
+{
+  "name": "mas-recon",
+  "version": "0.1.0",
+  "description": "Captures a structured trace of tool calls and subagent delegation, for MAS Recon's analyzer. Pure observer -- never blocks or modifies a tool call."
+}

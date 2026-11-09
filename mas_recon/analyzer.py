@@ -1,13 +1,13 @@
 """Reconstruct the real agent topology + failure signatures from a captured trace.
 
-This is the actual "recon" logic: turn a JSONL span dump from driver.py into
-(1) the real agent/tool graph, grounded in what actually executed, and
-(2) a list of observed failure signatures (right now: structured-output /
-tool-call validation errors and their retry outcome), which is exactly the
-category mas-intake's static scan can only ever mark "Unknown" for.
+This is the actual "recon" logic: turn a JSONL span dump into (1) the real
+agent/tool graph, grounded in what actually executed, and (2) a list of
+observed failure signatures (right now: structured-output / tool-call
+validation errors and their retry outcome) -- the kind of thing no amount
+of reading source code can tell you, because it only exists at runtime.
 
 Usage:
-    python harness/analyzer.py traces/<file>.jsonl [--out reports/<name>.md]
+    mas-recon <file>.jsonl [--out <name>.md]
 """
 
 from __future__ import annotations
@@ -26,21 +26,39 @@ def load_spans(path: Path) -> list[dict]:
 def detect_format(path: Path) -> str:
     """'strands' = Strands' native gen_ai.* convention (driver.py). 'monocle' =
     GPT Researcher's built-in tracer, a single JSON array. 'openinference' =
-    the OpenInference LangChain instrumentor (trading_driver.py), same JSONL
-    shell as 'strands' (same exporter code) but a completely different
-    attribute vocabulary. Three tracers, three schemas, two of them even both
-    nominally "OpenTelemetry" -- this is the first thing an analyzer has to
-    handle, not an edge case."""
+    the OpenInference LangChain/CrewAI/AutoGen instrumentors, same JSONL shell
+    as 'strands' (same exporter code) but a completely different attribute
+    vocabulary. 'claude_agent_sdk' = the OpenInference Claude Agent SDK
+    instrumentor -- also carries openinference.span.kind, but its own distinct
+    span-naming convention and attribute placement (real subagent identity
+    sits on the PARENT tool-call span, not the agent span itself), confirmed
+    only by actually running it -- checked before the generic openinference
+    fallback since it would otherwise misclassify. 'claude_code_hooks' = the
+    MAS Recon Claude Code plugin's own capture format -- not a span at all,
+    just flat hook-event records (hook_event_name, tool_name, agent_id, ...),
+    checked first since these records have no "attributes"/"name" shape in
+    common with anything else here. Five tracers, five schemas, three of
+    them nominally "OpenTelemetry" -- this is the first thing an analyzer has
+    to handle, not an edge case."""
     text = path.read_text().strip()
     if text.startswith("["):
         return "monocle"
-    for line in text.splitlines():
-        attrs = json.loads(line).get("attributes", {})
+    lines = [json.loads(line) for line in text.splitlines()]
+    if any("hook_event_name" in s for s in lines):
+        return "claude_code_hooks"
+    # Spans export child-before-parent (SimpleSpanProcessor fires on span end),
+    # so a generic TOOL span with no "ClaudeAgentSDK." name can appear BEFORE
+    # the identifying "ClaudeAgentSDK.*" line in the file. Scan the whole file
+    # for the more specific signal first; only fall back to the generic
+    # per-line checks once that's ruled out for every line.
+    if any(s.get("name", "").startswith("ClaudeAgentSDK.") for s in lines):
+        return "claude_agent_sdk"
+    for s in lines:
+        attrs = s.get("attributes", {})
         if "openinference.span.kind" in attrs:
             return "openinference"
         if "gen_ai.system" in attrs or "gen_ai.operation.name" in attrs:
             return "strands"
-    return "strands"
     return "strands"
 
 
@@ -216,9 +234,8 @@ def analyze(spans: list[dict]) -> dict:
 
 def render_markdown(result: dict, trace_path: Path, static_scan_note: str | None = None) -> str:
     """``static_scan_note`` is for when you actually have a prior static-analysis
-    result to contrast against (e.g. mas-intake's finding for one specific
-    repo). It's not a general claim -- omitted by default, since most traces
-    this analyzes won't have one."""
+    result to contrast against for one specific repo. It's not a general claim --
+    omitted by default, since most traces this analyzes won't have one."""
     lines = [f"# Trace-based fit report: {trace_path.name}", ""]
     if static_scan_note:
         lines += [static_scan_note, ""]
@@ -426,10 +443,9 @@ def render_monocle_markdown(result: dict, trace_path: Path) -> str:
     just the raw LLM/tool calls -- so there's no structural trick that recovers
     agent identity generically (OpenInference's "has an LLM descendant" heuristic
     has nothing to anchor to here). KNOWN_AGENT_PROMPTS and PHASE_LABELS above are
-    GPT Researcher-specific, derived from that one checkout's source, the same way
-    render_tradingagents_markdown is specific to one app. A genuinely generic
-    Monocle adapter would need a *different* per-app prompt or phase table every
-    time -- this is a real, open limitation, not a decision to hide."""
+    GPT Researcher-specific, derived from that one checkout's source. A genuinely
+    generic Monocle adapter would need a *different* per-app prompt or phase table
+    every time -- this is a real, open limitation, not a decision to hide."""
     lines = [f"# Trace-based fit report: {trace_path.name} (Monocle)", ""]
     lines.append("")
     lines.append(f"**{result['span_count']} spans captured** across {len(result['phases'])} graph phase(s): " + ", ".join(result["phases"]))
@@ -631,65 +647,304 @@ def analyze_openinference(spans: list[dict], known_agent_nodes: set[str] | None 
     }
 
 
-def render_tradingagents_markdown(result: dict, trace_path: Path) -> str:
-    """The bespoke, specific report written for the TradingAgents run -- kept as-is
-    for reproducibility. New OpenInference traces go through the generic
-    render_openinference_markdown below instead; this one is not a template."""
-    lines = [f"# Trace-based fit report: {trace_path.name} (OpenInference / TradingAgents)", ""]
+# ---------------------------------------------------------------------------
+# Claude Agent SDK (via the OpenInference Claude Agent SDK instrumentor) -- a
+# fifth schema, and one that needed a real run to understand, not just the
+# instrumentor's README. Confirmed empirically against an actual captured
+# trace: the root span (no parent) is the orchestrator and embeds its own
+# LLM data directly, not via a child span. Each subagent's real identity
+# (subagent_type, e.g. "researcher") sits on its PARENT tool-call span's
+# tool.parameters JSON -- the subagent's own AGENT span only echoes the
+# generic tool name ("Agent") in its agent.name attribute, which is useless
+# for identification. And the subagent's own LLM/token data is not captured
+# at all this way: its real model calls execute inside the separate `claude`
+# CLI subprocess, which doesn't relay per-call telemetry back as spans here --
+# only the orchestrator's own top-level call gets real token data.
+# ---------------------------------------------------------------------------
+
+
+def analyze_claude_agent_sdk(spans: list[dict]) -> dict:
+    by_id = {s["span_id"]: s for s in spans}
+
+    def llm_data(span: dict) -> dict | None:
+        a = span["attributes"]
+        if "llm.token_count.total" not in a:
+            return None
+        return {
+            "model": a.get("llm.model_name"),
+            "input": a.get("llm.token_count.prompt"),
+            "output": a.get("llm.token_count.completion"),
+            "total": a.get("llm.token_count.total"),
+        }
+
+    agents = []
+    for s in spans:
+        if not s["name"].startswith("ClaudeAgentSDK.") or s["attributes"].get("openinference.span.kind") != "AGENT":
+            continue
+
+        if s["parent_span_id"] is None:
+            agents.append({"name": "orchestrator", "role": "main", "tokens": llm_data(s)})
+            continue
+
+        parent = by_id.get(s["parent_span_id"])
+        subagent_type = None
+        if parent and parent["attributes"].get("openinference.span.kind") == "TOOL":
+            try:
+                params = json.loads(parent["attributes"].get("tool.parameters", "{}"))
+                subagent_type = params.get("subagent_type")
+            except json.JSONDecodeError:
+                pass
+        agents.append(
+            {
+                "name": subagent_type or s["attributes"].get("agent.name") or s["name"],
+                "role": "subagent",
+                "tokens": llm_data(s),
+            }
+        )
+
+    orchestrator = next((a for a in agents if a["role"] == "main"), None)
+    edges = []
+    if orchestrator:
+        # Real, stated edges: a subagent span's parent IS the tool call that
+        # spawned it -- read directly from the tree, not inferred from timing,
+        # unlike every timestamp-based fallback elsewhere in this file.
+        for a in agents:
+            if a["role"] == "subagent":
+                edges.append({"from": orchestrator["name"], "to": a["name"], "kind": "delegation-real"})
+
+    error_spans = [s for s in spans if s["status"] not in ("OK", "UNSET", None)]
+
+    return {
+        "span_count": len(spans),
+        "agents": agents,
+        "edges": edges,
+        "span_level_errors": len(error_spans),
+    }
+
+
+def render_claude_agent_sdk_markdown(result: dict, trace_path: Path) -> str:
+    lines = [f"# Trace-based fit report: {trace_path.name} (Claude Agent SDK)", ""]
     lines.append(
-        "mas-intake's static scan of this repo found only 5 low-confidence nodes from a helper "
-        "sub-graph and missed the main 12-node graph entirely -- node names come from a shared "
-        "`spec.agent_node` variable the scanner can't resolve statically, not literal strings "
-        "(only \"Trader\" is a literal). The hand-reviewed static notes *predicted* 12 nodes with "
-        "parallel fan-out and two debate loops, but the scanner itself couldn't confirm it. This "
-        "run does."
+        "Agent identity here is pieced together from two places, confirmed by reading a "
+        "real captured trace, not assumed from the instrumentor's documentation: the root "
+        "orchestrator is the span with no parent, and each subagent's real name comes from "
+        "`subagent_type` on its **parent** tool-call span -- the subagent's own span only "
+        "echoes the generic tool name (\"Agent\"), which carries no identifying information."
     )
     lines.append("")
-    lines.append(f"**{len(result['agents'])} real agent nodes executed**, {result['span_count']} spans captured.")
+    lines.append(f"**{len(result['agents'])} agent(s)**, {result['span_count']} spans captured.")
     lines.append("")
     lines.append("```mermaid")
     lines.append("flowchart TD")
+
+    def node_id(name: str) -> str:
+        return "n_" + "".join(c if c.isalnum() else "_" for c in name)
+
     for a in result["agents"]:
-        model = a["models"][0] if a["models"] else "?"
-        lines.append(f'  n{id(a)}["{a["name"]}\\n{model}"]')
+        label = a["name"] + (f"\\n{a['tokens']['model']}" if a["tokens"] else "")
+        lines.append(f'  {node_id(a["name"])}["{label}"]')
     for e in result["edges"]:
-        arrow = "-.->|parallel/overlap|" if e["kind"] == "parallel-overlap" else "-->"
-        from_id = next(f"n{id(a)}" for a in result["agents"] if a["name"] == e["from"])
-        to_id = next(f"n{id(a)}" for a in result["agents"] if a["name"] == e["to"])
-        lines.append(f"  {from_id} {arrow} {to_id}")
+        lines.append(f"  {node_id(e['from'])} -->|delegation| {node_id(e['to'])}")
     lines.append("```")
     lines.append("")
     lines.append(
-        "The four analysts at the top (Market/Sentiment/News/Fundamentals) show overlapping "
-        "start/end timestamps below -- a **real, observed parallel fan-out**, confirming what the "
-        "hand-written static notes guessed but the scanner couldn't verify."
+        "Edges above are a **real, stated delegation**: each subagent span's parent is "
+        "literally the tool call that spawned it, read from the span tree -- not inferred "
+        "from timestamps the way most other adapters in this tool have to."
     )
     lines.append("")
-    lines.append("## Agents (ground truth, from real execution)")
+    lines.append("## Agents")
     lines.append("")
-    lines.append("| Agent | Model | LLM calls | Total tokens | Tools called |")
-    lines.append("| --- | --- | --- | --- | --- |")
+    lines.append("| Agent | Role | Model | Tokens (in/out/total) |")
+    lines.append("| --- | --- | --- | --- |")
     for a in result["agents"]:
+        t = a["tokens"]
+        tok_str = f"{t['input']}/{t['output']}/{t['total']}" if t else "not captured"
+        model = t["model"] if t else "-"
+        lines.append(f"| {a['name']} | {a['role']} | {model} | {tok_str} |")
+    lines.append("")
+    missing = [a["name"] for a in result["agents"] if a["role"] == "subagent" and not a["tokens"]]
+    if missing:
         lines.append(
-            f"| {a['name']} | {', '.join(a['models']) or '?'} | {a['llm_calls']} | {a['total_tokens']} | "
-            f"{', '.join(a['tools_called']) or '-'} |"
+            f"> **Token/model data is not captured for subagent(s): {', '.join(missing)}.** "
+            "Confirmed empirically, not assumed: a subagent's real LLM calls execute inside "
+            "the separate `claude` CLI subprocess, and this instrumentor doesn't relay "
+            "per-call telemetry back as spans for that nested work -- only its final "
+            "hand-back result reaches the conversation. Claude Code's own native "
+            "OpenTelemetry traces (beta) nest real `llm_request` spans under each subagent "
+            "with proper token data; this lighter, OpenInference-based path doesn't have "
+            "that yet."
         )
-    lines.append("")
+        lines.append("")
     lines.append(f"Span-level errors: **{result['span_level_errors']}**.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Claude Code hooks (via the MAS Recon plugin) -- not a span tree at all,
+# just flat lifecycle events (PreToolUse/PostToolUse/PostToolUseFailure/
+# SubagentStart/SubagentStop) correlated by tool_use_id and agent_id. The
+# portable alternative to instrumenting a specific library: it works for ANY
+# Claude Code session, not just one agent-building framework, because the
+# hooks fire at the host level, not inside a Python/JS library's own code.
+# ---------------------------------------------------------------------------
+
+
+def analyze_claude_code_hooks(records: list[dict]) -> dict:
+    # Pair Pre/Post(Failure) events sharing a tool_use_id into one call.
+    calls: dict[str, dict] = {}
+    for r in records:
+        tuid = r.get("tool_use_id")
+        if not tuid:
+            continue
+        c = calls.setdefault(
+            tuid,
+            {"tool_name": r.get("tool_name"), "agent_id": None, "agent_type": None, "status": None, "error": None, "duration_ms": None},
+        )
+        if r.get("agent_id"):
+            c["agent_id"] = r["agent_id"]
+            c["agent_type"] = r.get("agent_type")
+        if r["hook_event_name"] == "PostToolUse":
+            c["status"] = "success"
+            c["duration_ms"] = r.get("duration_ms")
+        elif r["hook_event_name"] == "PostToolUseFailure":
+            c["status"] = "error"
+            c["error"] = r.get("error")
+            c["duration_ms"] = r.get("duration_ms")
+
+    # Group by agent_type (not agent_id) the same way the AutoGen fix does:
+    # the same role can be started more than once in one session, and that's
+    # one agent invoked repeatedly, not several distinct agents.
+    by_agent: dict[str | None, dict] = {}
+
+    def bucket(agent_type: str | None) -> dict:
+        key = agent_type
+        return by_agent.setdefault(
+            key,
+            {"name": agent_type or "orchestrator", "role": "subagent" if agent_type else "main", "invocations": set(), "calls": []},
+        )
+
+    for c in calls.values():
+        b = bucket(c["agent_type"])
+        b["invocations"].add(c["agent_id"])
+        b["calls"].append(c)
+
+    # Real, stated subagent-start/stop lifecycle, independent of tool calls --
+    # catches a subagent that started but made no recorded tool call at all,
+    # and carries the honest "did it hand back a final message" signal.
+    subagent_lifecycle: dict[str, dict] = {}
+    for r in records:
+        if r["hook_event_name"] == "SubagentStart":
+            subagent_lifecycle.setdefault(r.get("agent_id"), {"agent_type": r.get("agent_type"), "stopped": False, "last_message": None})
+        elif r["hook_event_name"] == "SubagentStop":
+            entry = subagent_lifecycle.setdefault(r.get("agent_id"), {"agent_type": r.get("agent_type"), "stopped": False, "last_message": None})
+            entry["stopped"] = True
+            entry["last_message"] = r.get("last_assistant_message")
+            bucket(r.get("agent_type"))["invocations"].add(r.get("agent_id"))
+
+    agents = []
+    for a in by_agent.values():
+        errors = []
+        for c in a["calls"]:
+            if c["status"] != "error":
+                continue
+            retried_ok = any(c2["tool_name"] == c["tool_name"] and c2["status"] == "success" for c2 in a["calls"] if c2 is not c)
+            errors.append(
+                {
+                    "tool": c["tool_name"],
+                    "detail": c["error"],
+                    "recovered": retried_ok,
+                    "category": "self-corrected" if retried_ok else "silent-failure",
+                }
+            )
+        agents.append(
+            {
+                "name": a["name"],
+                "role": a["role"],
+                "invocations": len(a["invocations"]) or 1,
+                "tool_calls": len(a["calls"]),
+                "errors": errors,
+            }
+        )
+
+    orchestrator = next((a for a in agents if a["role"] == "main"), None)
+    edges = []
+    if orchestrator:
+        for a in agents:
+            if a["role"] == "subagent":
+                edges.append({"from": orchestrator["name"], "to": a["name"], "kind": "delegation-real"})
+
+    all_errors = [{"agent": a["name"], **e} for a in agents for e in a["errors"]]
+    silent_failures = [e for e in all_errors if e["category"] == "silent-failure"]
+
+    return {
+        "event_count": len(records),
+        "agents": agents,
+        "edges": edges,
+        "errors": all_errors,
+        "silent_failure_count": len(silent_failures),
+    }
+
+
+def render_claude_code_hooks_markdown(result: dict, trace_path: Path) -> str:
+    lines = [f"# Trace-based fit report: {trace_path.name} (Claude Code hooks)", ""]
+    lines.append(
+        "Captured via the MAS Recon Claude Code plugin -- a portable alternative to "
+        "instrumenting one specific library: these hooks fire at the host level for "
+        "*any* Claude Code session, whatever framework or raw API calls are behind it. "
+        "Trade-off: no span timing tree, no token/model data -- just tool-call and "
+        "subagent lifecycle events, correlated by `tool_use_id` and `agent_id`."
+    )
     lines.append("")
-    lines.append("## A third instance of the same blind spot")
+    lines.append(f"**{len(result['agents'])} agent(s)**, {result['event_count']} hook events captured.")
+    lines.append("")
+    lines.append("```mermaid")
+    lines.append("flowchart TD")
+
+    def node_id(name: str) -> str:
+        return "n_" + "".join(c if c.isalnum() else "_" for c in name)
+
+    for a in result["agents"]:
+        lines.append(f'  {node_id(a["name"])}["{a["name"]}"]')
+    for e in result["edges"]:
+        lines.append(f"  {node_id(e['from'])} -->|delegation| {node_id(e['to'])}")
+    lines.append("```")
     lines.append("")
     lines.append(
-        "This run's own narrated output recorded two real, self-recovered failures -- a structured-output "
-        "parse failure on the Portfolio Manager's call (retried as free text) and a tool timeout on an "
-        "indicator fetch (retried, succeeded) -- yet every one of the 133 spans in this trace reports "
-        "status OK. This is the third framework in a row (after Thrad.ai's Swarm run and GPT Researcher's "
-        "DNS failures) where the trace's own status field says nothing went wrong while something clearly "
-        "did: retries the app's own code handles never reach the span layer as errors, regardless of which "
-        "tracer is used. A general-purpose check can't rely on span status alone; it has to read the "
-        "content of LLM/tool outputs for retry and self-correction language, which is a much harder, "
-        "less generic thing to build reliably."
+        "Edges are a **real, stated delegation**: each subagent's own `SubagentStart` event "
+        "is a direct fact, not inferred from timing."
     )
+    lines.append("")
+    lines.append("## Agents")
+    lines.append("")
+    lines.append("| Agent | Role | Invocations | Tool calls |")
+    lines.append("| --- | --- | --- | --- |")
+    for a in result["agents"]:
+        lines.append(f"| {a['name']} | {a['role']} | {a['invocations']} | {a['tool_calls']} |")
+    lines.append("")
+    lines.append("## Failure signatures")
+    lines.append("")
+    silent = [e for e in result["errors"] if e["category"] == "silent-failure"]
+    corrected = [e for e in result["errors"] if e["category"] == "self-corrected"]
+    lines.append(f"### Silent failures (unrecovered) -- {len(silent)}")
+    lines.append("")
+    if not silent:
+        lines.append("None in this run.")
+    else:
+        lines.append("| Agent | Tool | Detail |")
+        lines.append("| --- | --- | --- |")
+        for e in silent:
+            lines.append(f"| {e['agent']} | {e['tool']} | {e['detail']} |")
+    lines.append("")
+    lines.append(f"### Self-corrected failures (recovered) -- {len(corrected)}")
+    lines.append("")
+    if not corrected:
+        lines.append("None in this run.")
+    else:
+        lines.append("| Agent | Tool | Detail |")
+        lines.append("| --- | --- | --- |")
+        for e in corrected:
+            lines.append(f"| {e['agent']} | {e['tool']} | {e['detail']} |")
     return "\n".join(lines)
 
 
@@ -777,6 +1032,17 @@ def run_and_print(trace_path: Path, out_path: Path | None = None, known_agents: 
         print(f"span-level errors: {result['span_level_errors']} (does not include errors the app's own code swallowed)")
         for label, data in result["by_classification"].items():
             print(f"  - {label}: {data['count']} call(s), {data['total_tokens']} tokens")
+    elif fmt == "claude_agent_sdk":
+        spans = load_spans(trace_path)
+        result = analyze_claude_agent_sdk(spans)
+        report = render_claude_agent_sdk_markdown(result, trace_path)
+        out_path.write_text(report)
+
+        print(f"format: claude_agent_sdk, spans: {result['span_count']}")
+        print(f"agents found: {len(result['agents'])}")
+        for a in result["agents"]:
+            tok = a["tokens"]["total"] if a["tokens"] else "not captured"
+            print(f"  - {a['name']} ({a['role']}): tokens={tok}")
     elif fmt == "openinference":
         spans = load_spans(trace_path)
         known = set(known_agents.split(",")) if known_agents else None
@@ -789,6 +1055,17 @@ def run_and_print(trace_path: Path, out_path: Path | None = None, known_agents: 
         print(f"span-level errors: {result['span_level_errors']} (does not include errors the app's own code swallowed)")
         for a in result["agents"]:
             print(f"  - {a['name']}: {a['llm_calls']} LLM call(s), {a['total_tokens']} tokens")
+    elif fmt == "claude_code_hooks":
+        records = load_spans(trace_path)
+        result = analyze_claude_code_hooks(records)
+        report = render_claude_code_hooks_markdown(result, trace_path)
+        out_path.write_text(report)
+
+        print(f"format: claude_code_hooks, hook events: {result['event_count']}")
+        print(f"agents found: {len(result['agents'])}")
+        print(f"silent (unrecovered) failures: {result['silent_failure_count']}")
+        for a in result["agents"]:
+            print(f"  - {a['name']} ({a['role']}): {a['tool_calls']} tool call(s)")
     else:
         spans = load_spans(trace_path)
         result = analyze(spans)

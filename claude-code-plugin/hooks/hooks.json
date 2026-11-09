@@ -1,0 +1,20 @@
+{
+  "description": "Captures tool-call and subagent lifecycle events to a trace file MAS Recon can analyze. Registers on every tool/subagent event (matcher \"*\"); the script itself decides what's worth keeping.",
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/capture.py"] }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/capture.py"] }] }
+    ],
+    "PostToolUseFailure": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/capture.py"] }] }
+    ],
+    "SubagentStart": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/capture.py"] }] }
+    ],
+    "SubagentStop": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "python3", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/capture.py"] }] }
+    ]
+  }
+}

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mas-recon"
 version = "0.1.0"
-description = "Point it at a running multi-agent system; get back the real agent topology and silent-failure report, from an actual run, not a static guess."
+description = "Point it at a running multi-agent system; get back the real agent topology and silent-failure report, from an actual run."
 requires-python = ">=3.10"
 dependencies = [
     "opentelemetry-sdk>=1.27.0",
@@ -16,11 +16,14 @@ langchain = ["openinference-instrumentation-langchain"]
 strands = ["strands-agents"]
 crewai = ["openinference-instrumentation-crewai"]
 autogen = ["openinference-instrumentation-autogen-agentchat"]
+claude = ["openinference-instrumentation-claude-agent-sdk", "openinference-instrumentation-anthropic"]
 all = [
     "openinference-instrumentation-langchain",
     "strands-agents",
     "openinference-instrumentation-crewai",
     "openinference-instrumentation-autogen-agentchat",
+    "openinference-instrumentation-claude-agent-sdk",
+    "openinference-instrumentation-anthropic",
 ]
 
 [project.scripts]

@@ -37,12 +37,28 @@ def detect_format(path: Path) -> str:
     MAS Recon Claude Code plugin's own capture format -- not a span at all,
     just flat hook-event records (hook_event_name, tool_name, agent_id, ...),
     checked first since these records have no "attributes"/"name" shape in
-    common with anything else here. Five tracers, five schemas, three of
-    them nominally "OpenTelemetry" -- this is the first thing an analyzer has
-    to handle, not an edge case."""
+    common with anything else here. 'tapeagents_native' = ServiceNow
+    TapeAgents' own execution log (a "tape"): not OpenTelemetry at all --
+    TapeAgents routes LLM calls through litellm directly, so the generic
+    langchain auto-detection (langchain_core is merely an incidental
+    dependency here, never actually used for the LLM calls) produces an
+    empty, useless trace. The tape itself is a single JSON object (not
+    JSONL) with a top-level "steps" list, each step carrying its agent's
+    full delegation path directly (e.g. "Initiator/Manager/CodeExecutor")
+    and, for code execution, a literal exit_code -- better ground truth
+    than span-based inference would give even if it worked. Six tracers,
+    six schemas, three of them nominally "OpenTelemetry" -- this is the
+    first thing an analyzer has to handle, not an edge case."""
     text = path.read_text().strip()
     if text.startswith("["):
         return "monocle"
+    if text.startswith("{"):
+        try:
+            whole = json.loads(text)
+        except json.JSONDecodeError:
+            whole = None
+        if isinstance(whole, dict) and isinstance(whole.get("steps"), list):
+            return "tapeagents_native"
     lines = [json.loads(line) for line in text.splitlines()]
     if any("hook_event_name" in s for s in lines):
         return "claude_code_hooks"
@@ -948,6 +964,159 @@ def render_claude_code_hooks_markdown(result: dict, trace_path: Path) -> str:
     return "\n".join(lines)
 
 
+def analyze_tapeagents_native(tape: dict) -> dict:
+    """ServiceNow TapeAgents' own execution log (a "tape"): every step already
+    carries its agent's full delegation path directly (e.g.
+    "Initiator/Manager/CodeExecutor") and, for code execution, a literal
+    exit_code -- no blocklist heuristics or span-kind guessing needed at all,
+    the cleanest ground truth of any format this analyzer handles."""
+    steps = tape.get("steps", [])
+
+    paths: dict[str, dict] = {}
+
+    def node(path: str) -> dict:
+        return paths.setdefault(
+            path, {"path": path, "name": path.rsplit("/", 1)[-1], "steps": 0, "actions": 0}
+        )
+
+    for s in steps:
+        path = s.get("metadata", {}).get("agent") or ""
+        if not path:
+            continue
+        node(path)["steps"] += 1
+        if s.get("kind") == "execute_code":
+            node(path)["actions"] += 1
+
+    # Parent/child edges come straight from path nesting -- the path IS the
+    # tree. A mid-level coordinator can have no step directly attributed to
+    # it (everything it does ends up attributed to whichever child acted),
+    # so walk every seen path up to its root first to make sure it still
+    # gets a node, before building edges from the complete set.
+    all_paths = set(paths)
+    for path in list(all_paths):
+        parts = path.split("/")
+        for i in range(1, len(parts)):
+            all_paths.add("/".join(parts[:i]))
+    for path in all_paths:
+        node(path)
+    edges = [{"from": path.rsplit("/", 1)[0], "to": path} for path in all_paths if "/" in path]
+
+    # code_execution_result carries no agent of its own -- it belongs to
+    # whichever execute_code step immediately preceded it. Pair them in
+    # order, then look ahead for a later success by the same agent to tell
+    # self-corrected from silent/unrecovered, same distinction used
+    # everywhere else in this analyzer.
+    executions = []
+    pending_agent = None
+    for s in steps:
+        if s.get("kind") == "execute_code":
+            pending_agent = s.get("metadata", {}).get("agent") or ""
+        elif s.get("kind") == "code_execution_result" and pending_agent is not None:
+            exit_code = s.get("result", {}).get("exit_code")
+            executions.append({"agent": pending_agent, "exit_code": exit_code})
+            pending_agent = None
+
+    errors = []
+    for i, ex in enumerate(executions):
+        if ex["exit_code"] in (0, None):
+            continue
+        recovered = any(
+            later["agent"] == ex["agent"] and later["exit_code"] == 0 for later in executions[i + 1 :]
+        )
+        errors.append(
+            {
+                "agent": ex["agent"].rsplit("/", 1)[-1],
+                "tool": "execute_code",
+                "detail": f"exit_code={ex['exit_code']}",
+                "recovered": recovered,
+                "category": "self-corrected" if recovered else "silent-failure",
+            }
+        )
+
+    silent_failures = [e for e in errors if e["category"] == "silent-failure"]
+
+    return {
+        "step_count": len(steps),
+        "agents": [
+            {"name": a["name"], "path": a["path"], "steps": a["steps"], "actions": a["actions"]}
+            for a in paths.values()
+        ],
+        "edges": edges,
+        "errors": errors,
+        "silent_failure_count": len(silent_failures),
+    }
+
+
+def render_tapeagents_native_markdown(result: dict, trace_path: Path) -> str:
+    lines = [f"# Trace-based fit report: {trace_path.name} (TapeAgents native tape)", ""]
+    lines.append(
+        "Parsed directly from TapeAgents' own execution log (its \"tape\"), not "
+        "OpenTelemetry -- TapeAgents routes every LLM call through `litellm` "
+        "directly, and merely having `langchain_core` installed (an incidental "
+        "dependency, never actually used for the LLM calls) is enough to fool "
+        "generic auto-detection into attaching an instrumentor with nothing to "
+        "capture. The tape already carries each step's full agent delegation "
+        "path and, for code execution, a literal exit code -- no blocklist "
+        "heuristics or span-kind guessing needed."
+    )
+    lines.append("")
+    lines.append(f"**{len(result['agents'])} agent(s)**, {result['step_count']} tape steps captured.")
+    lines.append("")
+    lines.append("```mermaid")
+    lines.append("flowchart TD")
+
+    def node_id(name: str) -> str:
+        return "n_" + "".join(c if c.isalnum() else "_" for c in name)
+
+    for a in result["agents"]:
+        lines.append(f'  {node_id(a["path"])}["{a["name"]}"]')
+    for e in result["edges"]:
+        lines.append(f"  {node_id(e['from'])} -->|delegation| {node_id(e['to'])}")
+    lines.append("```")
+    lines.append("")
+    lines.append(
+        "Edges are the tape's own stated delegation path on every step -- a "
+        "direct fact, not inferred from timing or a name heuristic."
+    )
+    lines.append("")
+    lines.append("## Agents")
+    lines.append("")
+    lines.append("| Agent | Path | Tape steps | Code executions |")
+    lines.append("| --- | --- | --- | --- |")
+    for a in result["agents"]:
+        lines.append(f"| {a['name']} | `{a['path']}` | {a['steps']} | {a['actions']} |")
+    lines.append("")
+    lines.append(
+        "> Token/cost data isn't captured at this layer -- the tape doesn't "
+        "record it, not that no tokens were used."
+    )
+    lines.append("")
+    lines.append("## Failure signatures")
+    lines.append("")
+    silent = [e for e in result["errors"] if e["category"] == "silent-failure"]
+    corrected = [e for e in result["errors"] if e["category"] == "self-corrected"]
+    lines.append(f"### Silent failures (unrecovered) -- {len(silent)}")
+    lines.append("")
+    if not silent:
+        lines.append("None in this run.")
+    else:
+        lines.append("| Agent | Tool | Detail |")
+        lines.append("| --- | --- | --- |")
+        for e in silent:
+            lines.append(f"| {e['agent']} | {e['tool']} | {e['detail']} |")
+    lines.append("")
+    lines.append(f"### Self-corrected failures (recovered) -- {len(corrected)}")
+    lines.append("")
+    if not corrected:
+        lines.append("None in this run.")
+    else:
+        lines.append("| Agent | Tool | Detail |")
+        lines.append("| --- | --- | --- |")
+        for e in corrected:
+            lines.append(f"| {e['agent']} | {e['tool']} | {e['detail']} |")
+    return "\n".join(lines)
+
+
 def render_openinference_markdown(result: dict, trace_path: Path) -> str:
     """Generic report for any OpenInference-traced app -- no hardcoded narrative
     about one specific run. Honest about whether agent detection was automatic
@@ -1066,6 +1235,17 @@ def run_and_print(trace_path: Path, out_path: Path | None = None, known_agents: 
         print(f"silent (unrecovered) failures: {result['silent_failure_count']}")
         for a in result["agents"]:
             print(f"  - {a['name']} ({a['role']}): {a['tool_calls']} tool call(s)")
+    elif fmt == "tapeagents_native":
+        tape = json.loads(trace_path.read_text())
+        result = analyze_tapeagents_native(tape)
+        report = render_tapeagents_native_markdown(result, trace_path)
+        out_path.write_text(report)
+
+        print(f"format: tapeagents_native, tape steps: {result['step_count']}")
+        print(f"agents found: {len(result['agents'])}")
+        print(f"silent (unrecovered) failures: {result['silent_failure_count']}")
+        for a in result["agents"]:
+            print(f"  - {a['name']} ({a['path']}): {a['actions']} code execution(s)")
     else:
         spans = load_spans(trace_path)
         result = analyze(spans)
